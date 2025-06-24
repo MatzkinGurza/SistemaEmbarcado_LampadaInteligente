@@ -32,18 +32,6 @@ Nesta versão, a mesma lógica da máquina de estados foi encapsulada dentro de 
 
 Embora o FreeRTOS não fosse um requisito obrigatório para a funcionalidade do projeto, esta implementação serve como um estudo prático sobre como estruturar um sistema embarcado para ser mais escalável, modular e responsivo, preparando o terreno para futuras expansões com funcionalidades mais complexas.
 
-## 📂 Estrutura do Repositório (Sugestão)
-
-```
-.
-├── /src
-│   ├── /lampada_inteligente_classic   # Implementação com setup() e loop()
-│   └── /lampada_inteligente_freertos  # Implementação com FreeRTOS
-├── /docs
-│   └── MANUAL_DO_USUARIO_LAMPADA_INTELIGENTE.pdf # Manual técnico do projeto
-└── README.md                          # Este arquivo
-```
-
 ## 🧑‍💻 Autores
 
   * Eduardo da Silva Bauer Guimarães
