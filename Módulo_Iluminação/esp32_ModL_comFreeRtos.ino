@@ -1,5 +1,5 @@
 // =================================================================
-// Módulo de Iluminação (Receptor ESP-NOW) com FreeRTOS
+// Módulo de Iluminação 
 // =================================================================
 
 #include <Arduino.h>
@@ -9,16 +9,14 @@
 // =================================================================
 // 1. DEFINIÇÕES E CONSTANTES DE HARDWARE 
 // =================================================================
-#define PIN_DIMMER_ZERO_CROSS 2
-#define PIN_DIMMER_TRIAC_GATE 4
-#define PIN_RSWITCH 34
-#define PIN_BUTTON 23
+#define PIN_DIMMER_ZERO_CROSS 4  
+#define PIN_DIMMER_TRIAC_GATE 2  
+#define PIN_RSWITCH 34            // Pino ADC1, seguro para analogRead
+#define PIN_BUTTON 23             // Pino seguro de uso geral
 
 #define DELAY_MIN_US 800
 #define DELAY_MAX_US 7500
 #define IDLE_STATE 8333
-
-const int TEMPO_SEMICICLO = 1000000 / (2 * 60); // Assumindo 60Hz
 
 // =================================================================
 // 2. DEFINIÇÕES DA MÁQUINA DE ESTADOS E DADOS
@@ -30,33 +28,42 @@ struct TransicaoModL { EstadosModL proximoEstado; AcoesModL acao; TransicaoModL(
 typedef struct struct_message { int luminosityValue; } struct_message;
 
 // =================================================================
-// 3. VARIÁVEIS GLOBAIS E HANDLES FreeRTOS
+// 3. VARIÁVEIS GLOBAIS E DE CONTROLE
 // =================================================================
-// --- Variáveis do Dimmer e Controle
 volatile long currentBrightnessDelay = IDLE_STATE;
 int lampBrightnessPercent = 0;
-const float Kp = 5; // Ganho Proporcional 
+const float Kp = 0.4;
+const int LARGURA_ZONA_MORTA = 20;
+const int MUDANCA_MAX_BRILHO_POR_CICLO = 5;
 
-// --- Variáveis da Máquina de Estados e ESP-NOW
 struct_message receivedData;
-int setpointLuminosidade = 300; // Setpoint em Lux
+int setpointLuminosidade = 300;
 volatile long ultimoDadoRecebido = 0;
 const long WIFI_TIMEOUT_MS = 10000;
 EstadosModL estadoAtualModL = LAMP_IND;
 
-// --- Handles FreeRTOS ---
-SemaphoreHandle_t semZeroCross = NULL;
+// --- Handles e Mutex ---
 QueueHandle_t espNowQueue = NULL;
-portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+hw_timer_t *dimmerTimer = NULL;
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 
 // =================================================================
-// 4. ISRs E CALLBACKS 
+// 4. ISRs E CALLBACKS
 // =================================================================
+void IRAM_ATTR onTimer() {
+  timerAlarmDisable(dimmerTimer);
+  digitalWrite(PIN_DIMMER_TRIAC_GATE, HIGH);
+  delayMicroseconds(20);
+  digitalWrite(PIN_DIMMER_TRIAC_GATE, LOW);
+}
+
 void IRAM_ATTR detectaZeroCross() {
-  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-  xSemaphoreGiveFromISR(semZeroCross, &xHigherPriorityTaskWoken);
-  if (xHigherPriorityTaskWoken) {
-    portYIELD_FROM_ISR();
+  portENTER_CRITICAL_ISR(&timerMux);
+  long atraso_us = currentBrightnessDelay;
+  portEXIT_CRITICAL_ISR(&timerMux);
+  if (atraso_us != IDLE_STATE) {
+    timerAlarmWrite(dimmerTimer, atraso_us, false);
+    timerAlarmEnable(dimmerTimer);
   }
 }
 
@@ -64,7 +71,7 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
   struct_message data;
   if (len == sizeof(data)) {
     memcpy(&data, incomingData, sizeof(data));
-    xQueueSend(espNowQueue, &data, 0); // Envia para a fila sem bloquear
+    xQueueSend(espNowQueue, &data, 0);
     ultimoDadoRecebido = millis();
   }
 }
@@ -85,110 +92,73 @@ TransicaoModL MatrizModL[NUM_ESTADOS_MOD_L][NUM_EVENTOS_MOD_L];
 void setLampBrightnessFromPercentage(int percentage) {
   lampBrightnessPercent = constrain(percentage, 0, 100);
   long newDelay = (lampBrightnessPercent < 5) ? IDLE_STATE : map(lampBrightnessPercent, 0, 100, DELAY_MAX_US, DELAY_MIN_US);
-  portENTER_CRITICAL(&mux);
+  portENTER_CRITICAL(&timerMux);
   currentBrightnessDelay = newDelay;
-  portEXIT_CRITICAL(&mux);
+  portEXIT_CRITICAL(&timerMux);
 }
 
 void inicializarMatrizModL() {
-  // Configuração padrão: permanecer no mesmo estado sem ação
   for (int i = 0; i < NUM_ESTADOS_MOD_L; i++) {
     for (int j = 0; j < NUM_EVENTOS_MOD_L; j++) {
       MatrizModL[i][j] = TransicaoModL((EstadosModL)i, NA);
     }
   }
-  // MODO MANUAL
-  MatrizModL[LAMP_IND][AJUST_SWITCH] = { LAMP_IND, A01_AJUSTAR_BRILHO_MANUAL };
-  MatrizModL[LAMP_IND][BOT_SETP]     = { PROC_WIFI, A02_INICIAR_MODO_AUTO };
-  // MODO DE TRANSIÇÃO (AGUARDANDO DADOS)
-  MatrizModL[PROC_WIFI][AJUST_SWITCH]    = { LAMP_IND, A01_AJUSTAR_BRILHO_MANUAL };
-  MatrizModL[PROC_WIFI][DADOS_RECEBIDOS] = { RECEBENDO, A03_DADO_INICIAL_RECEBIDO };
-  // MODO AUTOMÁTICO
-  MatrizModL[RECEBENDO][AJUST_SWITCH] = { LAMP_IND, A01_AJUSTAR_BRILHO_MANUAL };
-  MatrizModL[RECEBENDO][TIMEOUT_WIFI] = { PROC_WIFI, A02_INICIAR_MODO_AUTO };
-  MatrizModL[RECEBENDO][AJUSTE_LUMINOSIDADE_AUTO] = { RECEBENDO, A04_AJUSTAR_BRILHO_AUTO };
+  MatrizModL[LAMP_IND][AJUST_SWITCH]               = TransicaoModL(LAMP_IND, A01_AJUSTAR_BRILHO_MANUAL);
+  MatrizModL[LAMP_IND][BOT_SETP]                  = TransicaoModL(PROC_WIFI, A02_INICIAR_MODO_AUTO);
+  MatrizModL[PROC_WIFI][AJUST_SWITCH]             = TransicaoModL(LAMP_IND, A01_AJUSTAR_BRILHO_MANUAL);
+  MatrizModL[PROC_WIFI][DADOS_RECEBIDOS]          = TransicaoModL(RECEBENDO, A03_DADO_INICIAL_RECEBIDO);
+  MatrizModL[RECEBENDO][AJUST_SWITCH]             = TransicaoModL(LAMP_IND, A01_AJUSTAR_BRILHO_MANUAL);
+  MatrizModL[RECEBENDO][TIMEOUT_WIFI]             = TransicaoModL(PROC_WIFI, A02_INICIAR_MODO_AUTO);
+  MatrizModL[RECEBENDO][AJUSTE_LUMINOSIDADE_AUTO] = TransicaoModL(RECEBENDO, A04_AJUSTAR_BRILHO_AUTO);
 }
 
 // =================================================================
-// 7. TAREFAS FreeRTOS
+// 7. TAREFA FreeRTOS (Máquina de Estados)
 // =================================================================
-
-// --- TAREFA 1: Controle do Dimmer (Alta Prioridade, Núcleo 1) ---
-void taskDimmerControl(void *pvParameters) {
-  Serial.println("[FreeRTOS] Tarefa do Dimmer iniciada no núcleo 1.");
-  for (;;) {
-    if (xSemaphoreTake(semZeroCross, portMAX_DELAY) == pdTRUE) {
-      long atraso_us;
-      portENTER_CRITICAL(&mux);
-      atraso_us = currentBrightnessDelay;
-      portEXIT_CRITICAL(&mux);
-
-      if (atraso_us != IDLE_STATE) {
-        delayMicroseconds(atraso_us);
-        digitalWrite(PIN_DIMMER_TRIAC_GATE, HIGH);
-        delayMicroseconds(20);
-        digitalWrite(PIN_DIMMER_TRIAC_GATE, LOW);
-      }
-    }
-  }
-}
-
-// --- TAREFA 2: Máquina de Estados e Lógica (Prioridade Normal, Núcleo 0) ---
 void taskStateMachine(void *pvParameters) {
-  Serial.println("[FreeRTOS] Tarefa da Máquina de Estados iniciada no núcleo 0.");
-  
-  // Inicializa a matriz de transições dentro da própria tarefa
+  Serial.println("[FreeRTOS] Tarefa da Máquina de Estados iniciada.");
   inicializarMatrizModL();
-  
-  // Define o brilho inicial baseado no potenciômetro
   setLampBrightnessFromPercentage(map(rSwitch.getValue(), 0, 4095, 0, 100));
 
   for (;;) {
-    // 1. GERAR EVENTO
     EventosModL evento = SEM_EVENTO;
     struct_message dataFromQueue;
 
-    if (rSwitch.hasChanged()) {
-      evento = AJUST_SWITCH;
-    } else if (button.wasClicked()) {
-      evento = BOT_SETP;
-    } else if (estadoAtualModL == RECEBENDO && (millis() - ultimoDadoRecebido > WIFI_TIMEOUT_MS)) {
-      evento = TIMEOUT_WIFI;
-    } else if (xQueueReceive(espNowQueue, &dataFromQueue, 0) == pdTRUE) {
+    if (rSwitch.hasChanged()) { evento = AJUST_SWITCH; }
+    else if (button.wasClicked()) { evento = BOT_SETP; }
+    else if (estadoAtualModL == RECEBENDO && (millis() - ultimoDadoRecebido > WIFI_TIMEOUT_MS)) { evento = TIMEOUT_WIFI; }
+    else if (xQueueReceive(espNowQueue, &dataFromQueue, 0) == pdTRUE) {
       receivedData = dataFromQueue;
       if (estadoAtualModL == PROC_WIFI) evento = DADOS_RECEBIDOS;
       else if (estadoAtualModL == RECEBENDO) evento = AJUSTE_LUMINOSIDADE_AUTO;
     }
 
-    // 2. EXECUTAR MÁQUINA DE ESTADOS
     if (evento != SEM_EVENTO) {
       AcoesModL acao = MatrizModL[estadoAtualModL][evento].acao;
-
-      // Executar Ação
       switch (acao) {
         case A01_AJUSTAR_BRILHO_MANUAL:
           setLampBrightnessFromPercentage(map(rSwitch.getValue(), 0, 4095, 0, 100));
           break;
         case A02_INICIAR_MODO_AUTO:
-          delay(100);
+          vTaskDelay(pdMS_TO_TICKS(100));
           break;
         case A03_DADO_INICIAL_RECEBIDO:
-          // Usa o primeiro valor recebido como setpoint, se desejado, ou mantém um fixo.
-          // setpointLuminosidade = receivedData.luminosityValue;
-          setLampBrightnessFromPercentage(50); // Inicia em 50%
+          setLampBrightnessFromPercentage(50);
           break;
         case A04_AJUSTAR_BRILHO_AUTO: {
           int erro = setpointLuminosidade - receivedData.luminosityValue;
-          int ajuste = (int)(erro * Kp);
-          int novoBrilho = lampBrightnessPercent + ajuste;
-          setLampBrightnessFromPercentage(novoBrilho);
+          if (abs(erro) > LARGURA_ZONA_MORTA) {
+            int ajuste = (int)(erro * Kp);
+            ajuste = constrain(ajuste, -MUDANCA_MAX_BRILHO_POR_CICLO, MUDANCA_MAX_BRILHO_POR_CICLO);
+            int novoBrilho = lampBrightnessPercent + ajuste;
+            setLampBrightnessFromPercentage(novoBrilho);
+          }
           break;
         }
       }
-      
-      // Mudar para o próximo estado
       estadoAtualModL = MatrizModL[estadoAtualModL][evento].proximoEstado;
     }
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
@@ -197,41 +167,28 @@ void taskStateMachine(void *pvParameters) {
 // =================================================================
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n--- Módulo da Lâmpada (FreeRTOS) ---");
+  Serial.println("\n--- Módulo Lâmpada  ---");
 
-  // Criação dos objetos FreeRTOS
-  semZeroCross = xSemaphoreCreateBinary();
   espNowQueue = xQueueCreate(5, sizeof(struct_message));
+  if (espNowQueue == NULL) { Serial.println("ERRO: Falha ao criar Fila."); while(1); }
 
-  if (semZeroCross == NULL || espNowQueue == NULL) {
-    Serial.println("ERRO FATAL: Falha ao criar objetos FreeRTOS.");
-    while(1); // Trava
-  }
-
-  // Configuração de Pinos
   pinMode(PIN_DIMMER_TRIAC_GATE, OUTPUT);
   digitalWrite(PIN_DIMMER_TRIAC_GATE, LOW);
   pinMode(PIN_DIMMER_ZERO_CROSS, INPUT_PULLUP);
 
-  // Configuração Wi-Fi e ESP-NOW
+  dimmerTimer = timerBegin(0, 80, true);
+  timerAttachInterrupt(dimmerTimer, &onTimer, true);
+  attachInterrupt(digitalPinToInterrupt(PIN_DIMMER_ZERO_CROSS), detectaZeroCross, RISING);
+
   WiFi.mode(WIFI_STA);
   if (esp_now_init() != ESP_OK) { Serial.println("Erro ESP-NOW"); return; }
   esp_now_register_recv_cb(OnDataRecv);
 
-  // Anexa a interrupção de Zero Cross
-  attachInterrupt(digitalPinToInterrupt(PIN_DIMMER_ZERO_CROSS), detectaZeroCross, RISING);
-
-  // Criação das Tarefas
-  // A tarefa da máquina de estados (lógica principal) roda no núcleo 0 com prioridade normal
   xTaskCreatePinnedToCore(taskStateMachine, "StateMachineTask", 10240, NULL, 1, NULL, 0);
-  
-  // A tarefa do dimmer (timing crítico) roda no núcleo 1 com prioridade alta
-  xTaskCreatePinnedToCore(taskDimmerControl, "DimmerControlTask", 2048, NULL, 3, NULL, 1);
 
-  Serial.println("Setup completo. Tarefas FreeRTOS iniciadas.");
+  Serial.println("Setup completo. Sistema iniciado.");
 }
 
 void loop() {
-  // O loop principal fica vazio. O FreeRTOS gerencia tudo.
   vTaskDelete(NULL);
 }
